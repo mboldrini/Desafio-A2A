@@ -2,6 +2,7 @@
 """Agente A2A - Central de Salas Hill Valley Tech.
 
 Implementa A2A v1.0 na porta 7300, chamando o servidor MCP internamente.
+Age como host MCP: descobre tools via tools/list e le o resource politica://uso.
 
 Uso:
     REQUEST_STATE_SECRET=<hex> python agente/agent.py
@@ -29,13 +30,17 @@ A2A_ENDPOINT = f"http://{A2A_HOST}:{A2A_PORT}/a2a"
 MCP_VERSION = "2026-07-28"
 MCP_CLIENT_INFO = {"name": "agente-central-de-salas", "version": "1.0.0"}
 MCP_CAPS = {"elicitation": {"form": {}}}
-CHAVE_MCP = "__main__:escolha_de_sala"
 
 # In-memory state — both dicts keyed by task_id
 tasks: dict[str, dict] = {}
 paused: dict[str, dict] = {}  # task_id → {request_state, chave, alternativas, args}
 
+# Runtime-discovered state (populated lazily before first tools/call)
+_tool_name: str | None = None         # discovered via tools/list
+_politica_version: str | None = None  # read via resources/read politica://uso
+
 TERMINAL = {"TASK_STATE_COMPLETED", "TASK_STATE_FAILED", "TASK_STATE_CANCELED"}
+FALLBACK_CHAVE = "__main__:escolha_de_sala"
 
 
 # ---------------------------------------------------------------------------
@@ -75,8 +80,11 @@ def _user_msg(msg_id: str, text: str, task_id: str | None = None) -> dict:
 
 
 def _artifact(data: dict) -> dict:
-    fields = ["reserva", "sala", "inicio", "fim", "responsavel", "politica"]
+    # politica version comes from resources/read, not from structuredContent
+    fields = ["reserva", "sala", "inicio", "fim", "responsavel"]
     filtered = {k: v for k, v in data.items() if k in fields and v is not None}
+    if _politica_version:
+        filtered["politica"] = _politica_version
     return {"artifactId": _aid(), "name": "reserva", "parts": [{"text": json.dumps(filtered, ensure_ascii=False)}]}
 
 
@@ -86,11 +94,10 @@ def _text_of(result: dict) -> str:
 
 def _alts_from_result(result: dict) -> list[str]:
     input_requests = result.get("inputRequests") or {}
-    chave = next(iter(input_requests), CHAVE_MCP)
+    chave = next(iter(input_requests), FALLBACK_CHAVE)
     params = (input_requests.get(chave) or {}).get("params") or {}
     schema = params.get("requestedSchema") or {}
-    properties = (schema.get("properties") or {})
-    sala_schema = properties.get("sala") or {}
+    sala_schema = (schema.get("properties") or {}).get("sala") or {}
     enum = sala_schema.get("enum")
     if enum:
         return enum
@@ -102,7 +109,8 @@ def _alts_from_result(result: dict) -> list[str]:
 # ---------------------------------------------------------------------------
 # MCP client
 # ---------------------------------------------------------------------------
-async def _mcp(params: dict, traceparent: str | None = None) -> dict:
+async def _mcp_request(method: str, params: dict, traceparent: str | None = None, name: str | None = None) -> dict:
+    """Generic MCP JSON-RPC request over Streamable HTTP."""
     meta: dict = {
         "io.modelcontextprotocol/protocolVersion": MCP_VERSION,
         "io.modelcontextprotocol/clientInfo": MCP_CLIENT_INFO,
@@ -115,18 +123,57 @@ async def _mcp(params: dict, traceparent: str | None = None) -> dict:
         "Content-Type": "application/json",
         "Accept": "application/json, text/event-stream",
         "MCP-Protocol-Version": MCP_VERSION,
-        "Mcp-Method": "tools/call",
-        "Mcp-Name": "reservar_sala",
+        "Mcp-Method": method,
     }
+    # Mcp-Name required for tools/call and resources/read
+    if name:
+        headers["Mcp-Name"] = name
+
     body = {
         "jsonrpc": "2.0",
         "id": secrets.token_hex(6),
-        "method": "tools/call",
+        "method": method,
         "params": {**params, "_meta": meta},
     }
     async with httpx.AsyncClient(timeout=30.0) as client:
         resp = await client.post(MCP_URL, json=body, headers=headers)
         return resp.json()
+
+
+async def _mcp_tools_list(traceparent: str | None = None) -> list[dict]:
+    resp = await _mcp_request("tools/list", {}, traceparent=traceparent)
+    result = resp.get("result") or {}
+    return result.get("tools") or []
+
+
+async def _mcp_resources_read(uri: str, traceparent: str | None = None) -> str:
+    resp = await _mcp_request("resources/read", {"uri": uri}, traceparent=traceparent, name=uri)
+    result = resp.get("result") or {}
+    contents = result.get("contents") or []
+    return contents[0].get("text", "") if contents else ""
+
+
+async def _mcp_tools_call(call_params: dict, traceparent: str | None = None) -> dict:
+    tool_name = call_params.get("name", "")
+    return await _mcp_request("tools/call", call_params, traceparent=traceparent, name=tool_name)
+
+
+async def _ensure_initialized(traceparent: str | None = None) -> None:
+    """Discover tools via tools/list and read policy via resources/read before first tools/call."""
+    global _tool_name, _politica_version
+    if _tool_name is None:
+        tools = await _mcp_tools_list(traceparent)
+        for t in tools:
+            if t.get("name") == "reservar_sala":
+                _tool_name = t["name"]
+                break
+        if _tool_name is None:
+            # Fallback: use first tool found, or known name
+            _tool_name = tools[0].get("name", "reservar_sala") if tools else "reservar_sala"
+    if _politica_version is None:
+        text = await _mcp_resources_read("politica://uso", traceparent)
+        first_line = text.split("\n")[0] if text else ""
+        _politica_version = first_line.replace("versao:", "").strip() or "unknown"
 
 
 # ---------------------------------------------------------------------------
@@ -151,6 +198,9 @@ def _parse_escolha(text: str) -> str | None:
 # SendMessage handler
 # ---------------------------------------------------------------------------
 async def _handle_send(params: dict, traceparent: str | None) -> dict:
+    # Discover tools and read policy before any tools/call
+    await _ensure_initialized(traceparent)
+
     message = params.get("message") or {}
     msg_id = message.get("messageId") or _mid()
     task_id_in = message.get("taskId")
@@ -166,7 +216,6 @@ async def _handle_send(params: dict, traceparent: str | None) -> dict:
         if state in TERMINAL:
             return {"error": {"code": -32600, "message": f"Task ja encerrada ({state})"}}
 
-        # Add user message to history first
         task["history"].append(_user_msg(msg_id, text, task_id=task_id_in))
 
         if state != "TASK_STATE_INPUT_REQUIRED":
@@ -178,7 +227,6 @@ async def _handle_send(params: dict, traceparent: str | None) -> dict:
 
         escolha = _parse_escolha(text)
         if escolha is None:
-            # Unparseable — re-ask
             return {"result": {"task": task}}
 
         alternativas = ps["alternativas"]
@@ -188,22 +236,23 @@ async def _handle_send(params: dict, traceparent: str | None) -> dict:
         elif escolha in alternativas:
             action = "accept"
         else:
-            # Invalid choice — keep paused
+            # Invalid choice — keep paused, repeat alternatives
             return {"result": {"task": task}}
 
-        # Build MCP retry call
+        # Use the exact chave returned by the server in inputRequests
+        chave = ps["chave"]
         retry_params: dict = {
-            "name": "reservar_sala",
+            "name": _tool_name,
             "arguments": ps["args"],
             "requestState": ps["request_state"],
             "inputResponses": {
-                CHAVE_MCP: {"action": action}
+                chave: {"action": action}
                 if action == "decline"
                 else {"action": action, "content": {"sala": escolha}}
             },
         }
         del paused[task_id_in]
-        resp = await _mcp(retry_params, traceparent)
+        resp = await _mcp_tools_call(retry_params, traceparent)
 
         result = resp.get("result") or {}
         rpc_error = resp.get("error")
@@ -246,7 +295,6 @@ async def _handle_send(params: dict, traceparent: str | None) -> dict:
     tasks[task_id] = task
     task["history"].append(_user_msg(msg_id, text))
 
-    # Parse command
     if not text.startswith("reservar") or (args := _parse_reservar(text)) is None:
         am = _agent_msg("Formato invalido. Use: reservar sala=X inicio=Y fim=Z responsavel=W", task_id, ctx_id)
         task["status"] = {"state": "TASK_STATE_FAILED", "message": am}
@@ -254,30 +302,27 @@ async def _handle_send(params: dict, traceparent: str | None) -> dict:
         return {"result": {"task": task}}
 
     mcp_args = {"sala": args["sala"], "inicio": args["inicio"], "fim": args["fim"], "responsavel": args["responsavel"]}
-    resp = await _mcp({"name": "reservar_sala", "arguments": mcp_args}, traceparent)
+    resp = await _mcp_tools_call({"name": _tool_name, "arguments": mcp_args}, traceparent)
 
     result = resp.get("result") or {}
     rpc_error = resp.get("error")
 
-    # Tool error
     if result.get("isError"):
         am = _agent_msg(_text_of(result), task_id, ctx_id)
         task["status"] = {"state": "TASK_STATE_FAILED", "message": am}
         task["history"].append(am)
         return {"result": {"task": task}}
 
-    # RPC-level error
     if rpc_error:
         am = _agent_msg(rpc_error.get("message", "Erro MCP"), task_id, ctx_id)
         task["status"] = {"state": "TASK_STATE_FAILED", "message": am}
         task["history"].append(am)
         return {"result": {"task": task}}
 
-    # input_required → pause
     if result.get("resultType") == "input_required":
         request_state = result.get("requestState")
         input_requests = result.get("inputRequests") or {}
-        chave = next(iter(input_requests), CHAVE_MCP)
+        chave = next(iter(input_requests), FALLBACK_CHAVE)
         alternativas = _alts_from_result(result)
 
         agent_text = "alternativas: " + ", ".join(alternativas)
